@@ -1,0 +1,2330 @@
+diff --git a/README.md b/README.md
+index b8a9d59..6c50d46 100644
+--- a/README.md
++++ b/README.md
+@@ -23,6 +23,9 @@ A graphical app store for Nix built with [libadwaita](https://gitlab.gnome.org/G
+ - Install packages with `nix profile` or `nix-env`
+ - Show updates for all installed packages
+ - Search for packages
++- Browse generated NixOS modules and edit supported options from authoritative NixOS option metadata
++  - Module edits are written only to an imported Nix Software Center managed file
++  - Rebuilds use a transactional `nixos-rebuild test` then `switch` flow
+ - Launch applications without installing via `nix-shell` and `nix run`
+ 
+ ## NixOS Flakes Installation
+@@ -70,6 +73,16 @@ with pkgs; [
+ 
+ For any other method of installation, when rebuilding you might be prompted to authenticate twice in a row by `pkexec`
+ 
++### Generated Modules workspace integration
++
++The generated **Modules** workspace deliberately writes only to a dedicated managed file beside the configured `configuration.nix`:
++
++```text
++nix-software-center-modules.nix
++```
++
++That file must be imported once by the host NixOS configuration. The provided NixOS installer kit creates the initial managed file and import automatically. The application never rewrites arbitrary user Nix files when applying module edits; it updates only the managed file, runs `nixos-rebuild test`, and switches only after the test succeeds.
++
+ ## 'nix profile' installation
+ ```bash
+ nix profile install github:snowfallorg/nix-software-center
+diff --git a/docs/MODULE_INDEX.md b/docs/MODULE_INDEX.md
+new file mode 100644
+index 0000000..86c0984
+--- /dev/null
++++ b/docs/MODULE_INDEX.md
+@@ -0,0 +1,125 @@
++# Deterministic NixOS module workspace
++
++Nix Software Center compiles the NixOS `options.json` documentation database into UI-ready module metadata. The pipeline is deterministic and does not use an LLM, Wingless, or another generative service.
++
++## Pipeline
++
++```text
++nix-data::cache::nixos::nixosoptions()
++                    |
++                    v
++             options.json
++                    |
++                    v
++        parse::modules::load_catalog
++                    |
++                    v
++              ModuleCatalog
++                    |
++                    v
++          GTK Modules workspace
++          /       |          \
++     search    generated     advanced/
++               controls      read-only
++                    |
++                    v
++        staged ManagedModuleState
++                    |
++                    v
++          generated Nix preview
++                    |
++                    v
++ /etc/nixos/nix-software-center-modules.nix
++                    |
++                    v
++       nsc-helper managed-config
++                    |
++          nixos-rebuild test
++                    |
++                    v
++          nixos-rebuild switch
++```
++
++## Module discovery
++
++A module root is discovered only when a non-dynamic boolean option ends in `.enable`. Options are assigned to the most specific enclosing root. Dynamic `<name>` paths, submodules, functions, unknown types, and collection types that require embedded package/path expressions fail closed to the `advanced` renderer.
++
++The compiler preserves the original Nix type string, default/example metadata, description, declaration paths, read-only state, nullability, and dynamic-path state.
++
++## Generated editors
++
++The GTK workspace renders supported option metadata into controls for:
++
++- booleans;
++- documented choices;
++- integers and finite floating point values;
++- strings;
++- paths;
++- nixpkgs package attribute paths;
++- JSON-backed primitive lists;
++- JSON-backed primitive attribute sets.
++
++Unsupported or ambiguous option types remain visible but are marked **Advanced** instead of being guessed into a writable control.
++
++Every generated option supports reset-to-default semantics. Changes are staged across module selections and the complete generated Nix file can be inspected before Apply.
++
++## Managed configuration boundary
++
++The module workspace never rewrites arbitrary `configuration.nix`. The NixOS installation integration imports one NSC-owned file:
++
++```text
++/etc/nixos/nix-software-center-modules.nix
++```
++
++The file contains both the generated Nix assignments and a one-line JSON state marker. The application reads only that marker on restart; it never attempts to reverse-parse arbitrary Nix syntax.
++
++The installer is responsible for importing the managed file once. If that integration file is not present, module browsing remains available but Apply is disabled.
++
++## Transactional rebuild
++
++`nsc-helper managed-config` owns the privileged transaction:
++
++1. preserve the previous managed file;
++2. write the candidate generated file from stdin;
++3. run `nixos-rebuild test`;
++4. only if test succeeds, run `nixos-rebuild switch`;
++5. if either step fails, restore the previous file;
++6. best-effort switch back to the restored configuration;
++7. only prune generations after a successful switch.
++
++The existing package installer is unchanged.
++
++## Benchmark / inspection utility
++
++On a NixOS development host:
++
++```bash
++cargo run --bin nsc-module-index -- --system /tmp/nsc-modules.json
++```
++
++Or against a specific option database:
++
++```bash
++cargo run --bin nsc-module-index -- /path/to/options.json /tmp/nsc-modules.json
++```
++
++The utility prints module/option coverage and elapsed compiler time. Supplying an output path writes the deterministic catalog as JSON for inspection.
++
++## Focused acceptance
++
++```bash
++cargo fmt --check
++cargo test parse::modules::tests
++cargo test parse::modules::managed_tests
++cargo test -p nsc-helper
++cargo run --bin nsc-module-index -- --system /tmp/nsc-modules-a.json
++cargo run --bin nsc-module-index -- --system /tmp/nsc-modules-b.json
++cmp /tmp/nsc-modules-a.json /tmp/nsc-modules-b.json
++cargo build
++```
++
++Then launch the application on NixOS, open **Modules**, stage a reversible option change, inspect the preview, Apply, and verify the rebuild dialog reports `test` followed by `switch`.
++
++## Deliberate boundaries
++
++The current editor does not attempt to synthesize values for dynamic submodules or arbitrary raw Nix expressions. Those remain advanced/manual territory until they receive purpose-built deterministic editors.
+diff --git a/docs/MODULE_INDEX_BENCHMARK.md b/docs/MODULE_INDEX_BENCHMARK.md
+new file mode 100644
+index 0000000..d8a2f64
+--- /dev/null
++++ b/docs/MODULE_INDEX_BENCHMARK.md
+@@ -0,0 +1,30 @@
++# Module index sandbox benchmark
++
++The sandbox benchmark validates the core indexing algorithm at NixOS-scale cardinality. The sandbox used for development did not contain Rust/Cargo/Nix/GTK system libraries, so the recorded timings are **Python surrogate timings**, not Rust performance claims and not an authoritative measurement of current nixpkgs renderer coverage.
++
++Synthetic corpus:
++
++- 24,000 option records;
++- 2.73 MiB compact JSON;
++- 2,615 inferred `.enable` module roots;
++- nested concrete child modules;
++- dynamic `<name>` paths;
++- read-only fields;
++- scalar, list, attribute-set, enum, submodule, and unknown types.
++
++Measured in the sandbox over repeated timing runs:
++
++| Measurement | Result |
++| --- | ---: |
++| JSON parse median | 22.76 ms |
++| catalog compile median | 55.92 ms |
++| catalog compile p95 | 125.96 ms |
++| 500 indexed lookups | 0.12 ms |
++| peak traced memory (single parse+compile) | 14.16 MiB |
++| deterministic output | yes |
++
++A separate 100,000-option / 10,000-module stress corpus compiled in **276.41 ms median** in the same Python surrogate (11.68 MiB compact JSON).
++
++The important algorithmic change made during the benchmark was replacing an O(options × modules) root scan with O(option path depth) prefix probing.
++
++After the benchmark, renderer policy was made **more conservative** for package/path collections, so the renderer-count fields in the retained JSON benchmark artifacts should be treated as historical first-slice evidence rather than current coverage numbers. The authoritative current coverage must come from `nsc-module-index` against a real current NixOS `options.json` on the target host.
+diff --git a/docs/benchmarks/module-index-sandbox-100k.json b/docs/benchmarks/module-index-sandbox-100k.json
+new file mode 100644
+index 0000000..eae53f2
+--- /dev/null
++++ b/docs/benchmarks/module-index-sandbox-100k.json
+@@ -0,0 +1,17 @@
++{
++  "corpus_options": 100000,
++  "payload_mib": 11.681514739990234,
++  "module_count": 10000,
++  "parse_median_ms": 105.59181000002127,
++  "compile_median_ms": 276.40990399999055,
++  "stats": {
++    "total_options": 100000,
++    "module_count": 10000,
++    "assigned_options": 100000,
++    "unassigned_options": 0,
++    "automatic_options": 76671,
++    "advanced_options": 23329,
++    "read_only_options": 0,
++    "dynamic_options": 10000
++  }
++}
+diff --git a/docs/benchmarks/module-index-sandbox-24k.json b/docs/benchmarks/module-index-sandbox-24k.json
+new file mode 100644
+index 0000000..0550eb9
+--- /dev/null
++++ b/docs/benchmarks/module-index-sandbox-24k.json
+@@ -0,0 +1,23 @@
++{
++  "corpus_options": 24000,
++  "payload_mib": 2.726184844970703,
++  "module_count": 2615,
++  "stats": {
++    "total_options": 24000,
++    "module_count": 2615,
++    "assigned_options": 24000,
++    "unassigned_options": 0,
++    "automatic_options": 18303,
++    "advanced_options": 5544,
++    "read_only_options": 183,
++    "dynamic_options": 2376
++  },
++  "parse_median_ms": 22.75957049999988,
++  "parse_p95_ms": 27.632294,
++  "compile_median_ms": 55.922297999984494,
++  "compile_p95_ms": 125.96102999998493,
++  "lookup_500_ms": 0.11674299997821436,
++  "peak_tracemalloc_mib": 14.162370681762695,
++  "deterministic": true,
++  "deterministic_sha256": "3fe1311ff9ea2c4e0d0e816c5931d3b0b601d4442937a2c7f80c509390e22ad0"
++}
+diff --git a/nsc-helper/src/main.rs b/nsc-helper/src/main.rs
+index 7f55491..fc61630 100644
+--- a/nsc-helper/src/main.rs
++++ b/nsc-helper/src/main.rs
+@@ -25,6 +25,16 @@ enum SubCommands {
+         #[arg(short, long)]
+         generations: Option<u32>,
+     },
++    ManagedConfig {
++        /// Write stdin to a Nix Software Center managed module file
++        #[arg(short, long)]
++        output: String,
++        /// How many generations to keep after the successful switch
++        #[arg(short, long)]
++        generations: Option<u32>,
++        /// Extra `nixos-rebuild` arguments shared by `test` and `switch`
++        arguments: Vec<String>,
++    },
+     Channel {
+         /// Whether to rebuild the system after updating channels
+         #[arg(short, long)]
+@@ -112,6 +122,16 @@ fn main() {
+                 std::process::exit(1);
+             }
+         },
++        SubCommands::ManagedConfig {
++            output,
++            generations,
++            arguments,
++        } => {
++            if let Err(err) = managed_config(&output, arguments, generations) {
++                eprintln!("{}", err);
++                std::process::exit(1);
++            }
++        }
+         SubCommands::Channel {
+             rebuild: dorebuild,
+             update,
+@@ -221,6 +241,60 @@ fn rebuild(args: Vec<String>, generations: Option<u32>) -> Result<(), Box<dyn Er
+     Ok(())
+ }
+ 
++fn managed_config(
++    output: &str,
++    arguments: Vec<String>,
++    generations: Option<u32>,
++) -> Result<(), Box<dyn Error>> {
++    let existed = std::path::Path::new(output).exists();
++    let old = fs::read_to_string(output).ok();
++
++    write_file(output)?;
++
++    let mut test_args = vec![String::from("test")];
++    test_args.extend(arguments.clone());
++    if let Err(err) = rebuild(test_args, None) {
++        restore_file(output, existed, old.as_deref())?;
++
++        // `nixos-rebuild test` can activate a temporary generation before a
++        // later activation step fails. Reassert the restored configuration.
++        let mut rollback_args = vec![String::from("switch")];
++        rollback_args.extend(arguments.clone());
++        if let Err(rollback_err) = rebuild(rollback_args, None) {
++            eprintln!("Rollback rebuild also failed: {}", rollback_err);
++        }
++        return Err(err);
++    }
++
++    let mut switch_args = vec![String::from("switch")];
++    switch_args.extend(arguments.clone());
++    if let Err(err) = rebuild(switch_args, generations) {
++        restore_file(output, existed, old.as_deref())?;
++
++        // Best-effort activation of the restored configuration. The original
++        // switch error remains authoritative even if this rollback rebuild fails.
++        let mut rollback_args = vec![String::from("switch")];
++        rollback_args.extend(arguments);
++        if let Err(rollback_err) = rebuild(rollback_args, None) {
++            eprintln!("Rollback rebuild also failed: {}", rollback_err);
++        }
++        return Err(err);
++    }
++
++    Ok(())
++}
++
++fn restore_file(path: &str, existed: bool, old: Option<&str>) -> Result<(), Box<dyn Error>> {
++    if existed {
++        if let Some(old) = old {
++            fs::write(path, old)?;
++        }
++    } else if std::path::Path::new(path).exists() {
++        fs::remove_file(path)?;
++    }
++    Ok(())
++}
++
+ fn channel() -> Result<(), Box<dyn Error>> {
+     let mut cmd = Command::new("nix-channel").arg("--update").spawn()?;
+     let x = cmd.wait()?;
+diff --git a/src/bin/nsc-module-index.rs b/src/bin/nsc-module-index.rs
+new file mode 100644
+index 0000000..a45052a
+--- /dev/null
++++ b/src/bin/nsc-module-index.rs
+@@ -0,0 +1,33 @@
++use nix_software_center::parse::modules::{load_catalog, load_current_nixos_catalog};
++use std::{env, error::Error, time::Instant};
++
++fn main() -> Result<(), Box<dyn Error>> {
++    let mut args = env::args().skip(1);
++    let source = args.next().unwrap_or_else(|| "--system".to_string());
++    let output = args.next();
++
++    let start = Instant::now();
++    let catalog = if source == "--system" {
++        load_current_nixos_catalog()?
++    } else {
++        load_catalog(&source)?
++    };
++    let elapsed = start.elapsed();
++
++    if let Some(path) = output {
++        catalog.write_json(path)?;
++    }
++
++    println!("Nix Software Center module index");
++    println!("modules: {}", catalog.stats.module_count);
++    println!("options total: {}", catalog.stats.total_options);
++    println!("options assigned: {}", catalog.stats.assigned_options);
++    println!("options unassigned: {}", catalog.stats.unassigned_options);
++    println!("automatic editors: {}", catalog.stats.automatic_options);
++    println!("advanced fallback: {}", catalog.stats.advanced_options);
++    println!("read-only: {}", catalog.stats.read_only_options);
++    println!("dynamic paths: {}", catalog.stats.dynamic_options);
++    println!("compile elapsed: {:.3?}", elapsed);
++
++    Ok(())
++}
+diff --git a/src/parse/mod.rs b/src/parse/mod.rs
+index 7934978..073cf98 100644
+--- a/src/parse/mod.rs
++++ b/src/parse/mod.rs
+@@ -1,3 +1,4 @@
+ pub mod packages;
+ pub mod config;
+-pub mod util;
+\ No newline at end of file
++pub mod util;
++pub mod modules;
+diff --git a/src/parse/modules.rs b/src/parse/modules.rs
+new file mode 100644
+index 0000000..1e7af95
+--- /dev/null
++++ b/src/parse/modules.rs
+@@ -0,0 +1,838 @@
++use anyhow::{Context, Result};
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    fs::File,
++    io::BufReader,
++    path::Path,
++};
++
++/// A single entry from the NixOS `options.json` documentation database.
++///
++/// The upstream schema intentionally carries default/example values as JSON because
++/// they can be ordinary values or tagged literal-expression objects.
++#[derive(Debug, Clone, Deserialize)]
++pub struct NixosOptionDoc {
++    #[serde(default)]
++    pub declarations: Vec<String>,
++    #[serde(default)]
++    pub default: Option<Value>,
++    #[serde(default)]
++    pub description: Option<String>,
++    #[serde(default)]
++    pub example: Option<Value>,
++    #[serde(default)]
++    pub loc: Vec<String>,
++    #[serde(default, rename = "readOnly")]
++    pub read_only: bool,
++    #[serde(default, rename = "type")]
++    pub type_name: Option<String>,
++}
++
++/// UI control that can be produced deterministically from an option type.
++///
++/// `Advanced` is a deliberate fail-closed bucket. Unknown types, submodules,
++/// functions, and dynamic `<name>` paths must not be guessed into an editor.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum RendererKind {
++    Toggle,
++    Choice,
++    Integer,
++    Float,
++    Text,
++    Path,
++    Package,
++    List,
++    KeyValue,
++    Advanced,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ModuleOptionSpec {
++    pub path: String,
++    pub relative_path: String,
++    pub type_name: String,
++    pub renderer: RendererKind,
++    pub nullable: bool,
++    pub choices: Vec<String>,
++    pub dynamic_path: bool,
++    pub read_only: bool,
++    pub description: Option<String>,
++    pub default: Option<Value>,
++    pub example: Option<Value>,
++    pub declarations: Vec<String>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ModuleSpec {
++    /// Stable module identifier. Currently identical to the option root.
++    pub id: String,
++    pub root: String,
++    pub title: String,
++    /// Closest enclosing generated module, if one exists.
++    pub parent_module: Option<String>,
++    pub enable_option: String,
++    pub declarations: Vec<String>,
++    pub options: Vec<ModuleOptionSpec>,
++    pub automatic_options: usize,
++    pub advanced_options: usize,
++    pub read_only_options: usize,
++}
++
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++pub struct ModuleCatalogStats {
++    pub total_options: usize,
++    pub module_count: usize,
++    pub assigned_options: usize,
++    pub unassigned_options: usize,
++    pub automatic_options: usize,
++    pub advanced_options: usize,
++    pub read_only_options: usize,
++    pub dynamic_options: usize,
++}
++
++/// Deterministically generated module metadata.
++///
++/// A BTreeMap is intentional: lookup is logarithmic for a small module set while
++/// iteration and serialized output remain stable across runs.
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++pub struct ModuleCatalog {
++    pub modules: BTreeMap<String, ModuleSpec>,
++    pub stats: ModuleCatalogStats,
++}
++
++impl ModuleCatalog {
++    pub fn get(&self, id: &str) -> Option<&ModuleSpec> {
++        self.modules.get(id)
++    }
++
++    pub fn write_json<P: AsRef<Path>>(&self, path: P) -> Result<()> {
++        let file = File::create(path.as_ref())
++            .with_context(|| format!("could not create {}", path.as_ref().display()))?;
++        serde_json::to_writer(file, self).context("could not serialize module catalog")?;
++        Ok(())
++    }
++}
++
++/// Fetch/cache the option database through the existing `nix-data` path and compile it.
++///
++/// This is intentionally not called from application startup yet. Module indexing should
++/// remain lazy until the module UI consumes it, avoiding a startup regression for the
++/// existing package-only experience.
++pub fn load_current_nixos_catalog() -> Result<ModuleCatalog> {
++    let path = nix_data::cache::nixos::nixosoptions()
++        .context("could not retrieve current NixOS options database")?;
++    load_catalog(path)
++}
++
++/// Load NixOS option documentation and compile it into a deterministic module catalog.
++pub fn load_catalog<P: AsRef<Path>>(path: P) -> Result<ModuleCatalog> {
++    let file = File::open(path.as_ref())
++        .with_context(|| format!("could not open {}", path.as_ref().display()))?;
++    let reader = BufReader::new(file);
++    let docs: BTreeMap<String, NixosOptionDoc> =
++        serde_json::from_reader(reader).context("could not parse NixOS options.json")?;
++    Ok(compile_catalog(&docs))
++}
++
++/// Compile the NixOS options database into module groups.
++///
++/// Root inference is deliberately narrow:
++/// - the option must end in `.enable`;
++/// - its documented type must be boolean-like;
++/// - the path must not contain a dynamic `<name>` segment.
++///
++/// Options are assigned to the longest matching root. That lets a specific child
++/// module (for example `services.foo.backends.bar`) win over its parent while
++/// preserving deterministic behavior.
++pub fn compile_catalog(docs: &BTreeMap<String, NixosOptionDoc>) -> ModuleCatalog {
++    let roots = discover_module_roots(docs);
++    let mut grouped: BTreeMap<String, Vec<ModuleOptionSpec>> = BTreeMap::new();
++    let mut stats = ModuleCatalogStats {
++        total_options: docs.len(),
++        module_count: roots.len(),
++        ..Default::default()
++    };
++
++    for (path, doc) in docs {
++        let root = longest_matching_root(path, &roots);
++        let Some(root) = root else {
++            stats.unassigned_options += 1;
++            continue;
++        };
++
++        let spec = option_spec(path, root, doc);
++        stats.assigned_options += 1;
++        if spec.dynamic_path {
++            stats.dynamic_options += 1;
++        }
++        if spec.read_only {
++            stats.read_only_options += 1;
++        }
++        if spec.renderer == RendererKind::Advanced {
++            stats.advanced_options += 1;
++        } else if !spec.read_only {
++            stats.automatic_options += 1;
++        }
++        grouped.entry(root.to_string()).or_default().push(spec);
++    }
++
++    let mut modules = BTreeMap::new();
++    for root in &roots {
++        let mut options = grouped.remove(root).unwrap_or_default();
++        options.sort_by(|a, b| a.path.cmp(&b.path));
++
++        let automatic_options = options
++            .iter()
++            .filter(|x| x.renderer != RendererKind::Advanced && !x.read_only)
++            .count();
++        let advanced_options = options
++            .iter()
++            .filter(|x| x.renderer == RendererKind::Advanced)
++            .count();
++        let read_only_options = options.iter().filter(|x| x.read_only).count();
++        let declarations = options
++            .iter()
++            .flat_map(|x| x.declarations.iter().cloned())
++            .collect::<BTreeSet<_>>()
++            .into_iter()
++            .collect::<Vec<_>>();
++        let enable_option = format!("{}.enable", root);
++        let parent_module = parent_module_root(root, &roots).map(str::to_string);
++
++        modules.insert(
++            root.clone(),
++            ModuleSpec {
++                id: root.clone(),
++                root: root.clone(),
++                title: root.clone(),
++                parent_module,
++                enable_option,
++                declarations,
++                options,
++                automatic_options,
++                advanced_options,
++                read_only_options,
++            },
++        );
++    }
++
++    ModuleCatalog { modules, stats }
++}
++
++fn discover_module_roots(docs: &BTreeMap<String, NixosOptionDoc>) -> BTreeSet<String> {
++    docs.iter()
++        .filter_map(|(path, doc)| {
++            let root = path.strip_suffix(".enable")?;
++            if root.is_empty()
++                || contains_dynamic_segment(root)
++                || !is_boolean_type(doc.type_name.as_deref().unwrap_or_default())
++            {
++                return None;
++            }
++            Some(root.to_string())
++        })
++        .collect()
++}
++
++/// Find the most specific module root by probing successively shorter path prefixes.
++/// Typical NixOS option paths are only a few segments deep, so this is O(path depth)
++/// instead of scanning every module root for every option.
++fn longest_matching_root<'a>(path: &str, roots: &'a BTreeSet<String>) -> Option<&'a str> {
++    let mut candidate = path;
++    loop {
++        if let Some(root) = roots.get(candidate) {
++            return Some(root.as_str());
++        }
++        let split = candidate.rfind('.')?;
++        candidate = &candidate[..split];
++    }
++}
++
++fn parent_module_root<'a>(root: &str, roots: &'a BTreeSet<String>) -> Option<&'a str> {
++    let split = root.rfind('.')?;
++    longest_matching_root(&root[..split], roots)
++}
++
++fn option_spec(path: &str, root: &str, doc: &NixosOptionDoc) -> ModuleOptionSpec {
++    let relative_path = path
++        .strip_prefix(root)
++        .and_then(|x| x.strip_prefix('.'))
++        .unwrap_or(path)
++        .to_string();
++    let type_name = doc.type_name.clone().unwrap_or_else(|| "unspecified".into());
++    let dynamic_path = contains_dynamic_segment(path);
++    let (mut renderer, nullable, choices) = classify_type(&type_name);
++    if dynamic_path {
++        renderer = RendererKind::Advanced;
++    }
++
++    ModuleOptionSpec {
++        path: path.to_string(),
++        relative_path,
++        type_name,
++        renderer,
++        nullable,
++        choices,
++        dynamic_path,
++        read_only: doc.read_only,
++        description: doc.description.clone(),
++        default: doc.default.clone(),
++        example: doc.example.clone(),
++        declarations: doc.declarations.clone(),
++    }
++}
++
++pub fn classify_type(type_name: &str) -> (RendererKind, bool, Vec<String>) {
++    let mut ty = type_name.trim().to_lowercase();
++    let mut nullable = false;
++
++    if let Some(inner) = ty.strip_prefix("null or ") {
++        nullable = true;
++        ty = inner.trim().to_string();
++    }
++
++    // Complex module structure is never flattened into a generic editor.
++    if ty.contains("submodule")
++        || ty.contains("function")
++        || ty == "anything"
++        || ty == "raw value"
++        || ty == "unspecified"
++    {
++        return (RendererKind::Advanced, nullable, vec![]);
++    }
++
++    if ty.starts_with("list of ") || ty.starts_with("non-empty (list of ") {
++        // Lists whose elements require Nix expressions (packages/paths) need a
++        // type-aware editor rather than pretending JSON strings are equivalent.
++        if ty.contains("package") || ty.contains(" path") {
++            return (RendererKind::Advanced, nullable, vec![]);
++        }
++        return (RendererKind::List, nullable, vec![]);
++    }
++
++    if ty.starts_with("attribute set of ") || ty.starts_with("lazy attribute set of ") {
++        if ty.contains("package") || ty.contains(" path") {
++            return (RendererKind::Advanced, nullable, vec![]);
++        }
++        return (RendererKind::KeyValue, nullable, vec![]);
++    }
++
++    if ty.starts_with("one of ") || ty.contains(" one of ") {
++        return (RendererKind::Choice, nullable, extract_choices(type_name));
++    }
++
++    if is_boolean_type(&ty) {
++        return (RendererKind::Toggle, nullable, vec![]);
++    }
++
++    if ty.contains("integer") || ty.contains("int between") {
++        return (RendererKind::Integer, nullable, vec![]);
++    }
++
++    if ty.contains("floating point") || ty.contains("float") || ty.contains("number") {
++        return (RendererKind::Float, nullable, vec![]);
++    }
++
++    if ty == "path" || ty.ends_with(" path") || ty.contains("path in the nix store") {
++        return (RendererKind::Path, nullable, vec![]);
++    }
++
++    if ty == "package" || ty.ends_with(" package") {
++        return (RendererKind::Package, nullable, vec![]);
++    }
++
++    if ty == "string"
++        || ty.contains("string")
++        || ty == "lines"
++        || ty == "passwd entry"
++        || ty == "shell package"
++    {
++        return (RendererKind::Text, nullable, vec![]);
++    }
++
++    (RendererKind::Advanced, nullable, vec![])
++}
++
++fn is_boolean_type(type_name: &str) -> bool {
++    matches!(type_name.trim().to_lowercase().as_str(), "boolean" | "bool")
++}
++
++fn contains_dynamic_segment(path: &str) -> bool {
++    path.split('.')
++        .any(|segment| segment.starts_with('<') && segment.ends_with('>'))
++}
++
++/// Extract quoted alternatives from an option type such as
++/// `one of "auto", "yes", "no"`. NixOS type descriptions that cannot be
++/// losslessly interpreted simply return an empty list; the original type string
++/// remains available to the UI.
++fn extract_choices(type_name: &str) -> Vec<String> {
++    let mut out = Vec::new();
++    let mut chars = type_name.chars().peekable();
++
++    while let Some(ch) = chars.next() {
++        if ch != '"' {
++            continue;
++        }
++
++        let mut current = String::new();
++        let mut escaped = false;
++        for next in chars.by_ref() {
++            if escaped {
++                current.push(next);
++                escaped = false;
++            } else if next == '\\' {
++                escaped = true;
++            } else if next == '"' {
++                break;
++            } else {
++                current.push(next);
++            }
++        }
++        if !current.is_empty() && !out.contains(&current) {
++            out.push(current);
++        }
++    }
++
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn doc(type_name: &str) -> NixosOptionDoc {
++        NixosOptionDoc {
++            declarations: vec!["nixos/modules/test.nix".into()],
++            default: None,
++            description: None,
++            example: None,
++            loc: vec![],
++            read_only: false,
++            type_name: Some(type_name.into()),
++        }
++    }
++
++    #[test]
++    fn discovers_enable_root_and_assigns_siblings() {
++        let docs = BTreeMap::from([
++            ("services.openssh.enable".into(), doc("boolean")),
++            ("services.openssh.openFirewall".into(), doc("boolean")),
++            ("services.openssh.ports".into(), doc("list of 16 bit unsigned integer; between 0 and 65535 (both inclusive)")),
++            ("networking.hostName".into(), doc("string")),
++        ]);
++
++        let catalog = compile_catalog(&docs);
++        let module = catalog.get("services.openssh").unwrap();
++        assert_eq!(catalog.stats.module_count, 1);
++        assert_eq!(catalog.stats.assigned_options, 3);
++        assert_eq!(catalog.stats.unassigned_options, 1);
++        assert_eq!(module.options.len(), 3);
++    }
++
++    #[test]
++    fn longest_enable_root_wins() {
++        let docs = BTreeMap::from([
++            ("services.foo.enable".into(), doc("boolean")),
++            ("services.foo.child.enable".into(), doc("boolean")),
++            ("services.foo.child.port".into(), doc("signed integer")),
++        ]);
++
++        let catalog = compile_catalog(&docs);
++        assert_eq!(catalog.get("services.foo.child").unwrap().options.len(), 2);
++        assert_eq!(catalog.get("services.foo").unwrap().options.len(), 1);
++        assert_eq!(
++            catalog.get("services.foo.child").unwrap().parent_module.as_deref(),
++            Some("services.foo")
++        );
++    }
++
++    #[test]
++    fn dynamic_paths_fail_closed() {
++        let docs = BTreeMap::from([
++            ("services.nginx.enable".into(), doc("boolean")),
++            ("services.nginx.virtualHosts.<name>.forceSSL".into(), doc("boolean")),
++        ]);
++
++        let catalog = compile_catalog(&docs);
++        let option = catalog
++            .get("services.nginx")
++            .unwrap()
++            .options
++            .iter()
++            .find(|x| x.path.contains("virtualHosts"))
++            .unwrap();
++        assert_eq!(option.renderer, RendererKind::Advanced);
++        assert!(option.dynamic_path);
++    }
++
++    #[test]
++    fn nested_dynamic_enable_is_not_a_module_root() {
++        let docs = BTreeMap::from([
++            ("services.foo.enable".into(), doc("boolean")),
++            ("services.foo.backends.<name>.enable".into(), doc("boolean")),
++        ]);
++
++        let catalog = compile_catalog(&docs);
++        assert_eq!(catalog.stats.module_count, 1);
++        assert!(catalog.get("services.foo.backends.<name>").is_none());
++    }
++
++    #[test]
++    fn renderer_mapping_is_conservative() {
++        assert_eq!(classify_type("boolean").0, RendererKind::Toggle);
++        assert_eq!(classify_type("null or string"), (RendererKind::Text, true, vec![]));
++        assert_eq!(classify_type("list of string").0, RendererKind::List);
++        assert_eq!(classify_type("list of package").0, RendererKind::Advanced);
++        assert_eq!(classify_type("attribute set of string").0, RendererKind::KeyValue);
++        assert_eq!(classify_type("attribute set of package").0, RendererKind::Advanced);
++        assert_eq!(classify_type("submodule").0, RendererKind::Advanced);
++        assert_eq!(
++            classify_type("one of \"auto\", \"yes\", \"no\"").2,
++            vec!["auto", "yes", "no"]
++        );
++    }
++}
++
++/// Marker used to persist the editor state inside the generated Nix file.
++/// Keeping state and generated configuration together prevents a user-level
++/// sidecar database from drifting away from the system configuration.
++pub const MANAGED_STATE_PREFIX: &str = "# nix-software-center-state-json: ";
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
++pub enum ManagedValue {
++    Null,
++    Bool(bool),
++    Integer(i64),
++    Float(f64),
++    String(String),
++    Choice(String),
++    Path(String),
++    Package(String),
++    Json(Value),
++}
++
++#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
++pub struct ManagedModuleState {
++    pub values: BTreeMap<String, ManagedValue>,
++}
++
++impl ManagedModuleState {
++    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
++        let path = path.as_ref();
++        if !path.exists() {
++            return Ok(Self::default());
++        }
++
++        let source = std::fs::read_to_string(path)
++            .with_context(|| format!("could not read {}", path.display()))?;
++        for line in source.lines().take(16) {
++            if let Some(json) = line.strip_prefix(MANAGED_STATE_PREFIX) {
++                return serde_json::from_str(json)
++                    .context("could not parse embedded Nix Software Center module state");
++            }
++        }
++
++        // A hand-created or older managed file is safe to treat as having no
++        // editable state. We never attempt to reverse-parse arbitrary Nix.
++        Ok(Self::default())
++    }
++
++    pub fn render_nix(&self) -> Result<String> {
++        let state_json = serde_json::to_string(self)
++            .context("could not serialize managed module state")?;
++        let mut out = String::new();
++        out.push_str("# Generated by Nix Software Center. Do not edit by hand.\n");
++        out.push_str(MANAGED_STATE_PREFIX);
++        out.push_str(&state_json);
++        out.push('\n');
++        out.push_str("{ pkgs, lib, ... }:\nlib.mkMerge [\n");
++
++        // Each assignment is its own module fragment. `lib.mkMerge` avoids
++        // syntactic parent/child collisions such as setting both `a.b` and
++        // `a.b.c` while still letting the NixOS module system resolve types.
++        for (path, value) in &self.values {
++            out.push_str("  { ");
++            out.push_str(&render_attr_path(path));
++            out.push_str(" = ");
++            out.push_str(&render_managed_value(value)?);
++            out.push_str("; }\n");
++        }
++
++        out.push_str("]\n");
++        Ok(out)
++    }
++}
++
++/// Convert a static NixOS option path into a Nix attribute path. Segments that
++/// are not plain identifiers are quoted instead of being emitted as raw syntax.
++pub fn render_attr_path(path: &str) -> String {
++    path.split('.')
++        .map(|segment| {
++            if is_nix_identifier(segment) {
++                segment.to_string()
++            } else {
++                nix_string(segment)
++            }
++        })
++        .collect::<Vec<_>>()
++        .join(".")
++}
++
++pub fn managed_config_path(system_config: Option<&str>) -> Option<std::path::PathBuf> {
++    let config = system_config?;
++    let parent = Path::new(config).parent()?;
++    Some(parent.join("nix-software-center-modules.nix"))
++}
++
++pub fn managed_value_from_text(spec: &ModuleOptionSpec, text: &str) -> Result<ManagedValue> {
++    let trimmed = text.trim();
++    if spec.nullable && trimmed == "null" {
++        return Ok(ManagedValue::Null);
++    }
++    match spec.renderer {
++        RendererKind::Integer => trimmed
++            .parse::<i64>()
++            .map(ManagedValue::Integer)
++            .context("expected an integer"),
++        RendererKind::Float => {
++            let value = trimmed.parse::<f64>().context("expected a number")?;
++            if !value.is_finite() {
++                anyhow::bail!("number must be finite");
++            }
++            Ok(ManagedValue::Float(value))
++        }
++        RendererKind::Text => Ok(ManagedValue::String(text.to_string())),
++        RendererKind::Choice => {
++            if !spec.choices.is_empty() && !spec.choices.iter().any(|x| x == text) {
++                anyhow::bail!("value is not one of the documented choices");
++            }
++            Ok(ManagedValue::Choice(text.to_string()))
++        }
++        RendererKind::Path => {
++            if trimmed.is_empty() {
++                anyhow::bail!("path cannot be empty");
++            }
++            Ok(ManagedValue::Path(text.to_string()))
++        }
++        RendererKind::Package => {
++            let attribute = trimmed.strip_prefix("pkgs.").unwrap_or(trimmed);
++            if !is_package_attr_path(attribute) {
++                anyhow::bail!("package must be a nixpkgs attribute path such as firefox or python3Packages.requests");
++            }
++            Ok(ManagedValue::Package(attribute.to_string()))
++        }
++        RendererKind::List => {
++            let value: Value = serde_json::from_str(text)
++                .context("list editor expects JSON, for example [\"one\", \"two\"]")?;
++            if !value.is_array() {
++                anyhow::bail!("list editor expects a JSON array");
++            }
++            Ok(ManagedValue::Json(value))
++        }
++        RendererKind::KeyValue => {
++            let value: Value = serde_json::from_str(text)
++                .context("attribute editor expects JSON, for example {\"key\": \"value\"}")?;
++            if !value.is_object() {
++                anyhow::bail!("attribute editor expects a JSON object");
++            }
++            Ok(ManagedValue::Json(value))
++        }
++        RendererKind::Toggle => anyhow::bail!("boolean values are edited with a switch"),
++        RendererKind::Advanced => anyhow::bail!("advanced options are read-only in the generated editor"),
++    }
++}
++
++pub fn managed_value_editor_text(value: &ManagedValue) -> String {
++    match value {
++        ManagedValue::Null => "null".into(),
++        ManagedValue::Bool(value) => value.to_string(),
++        ManagedValue::Integer(value) => value.to_string(),
++        ManagedValue::Float(value) => value.to_string(),
++        ManagedValue::String(value)
++        | ManagedValue::Choice(value)
++        | ManagedValue::Path(value)
++        | ManagedValue::Package(value) => value.clone(),
++        ManagedValue::Json(value) => serde_json::to_string_pretty(value).unwrap_or_default(),
++    }
++}
++
++fn render_managed_value(value: &ManagedValue) -> Result<String> {
++    match value {
++        ManagedValue::Null => Ok("null".into()),
++        ManagedValue::Bool(value) => Ok(value.to_string()),
++        ManagedValue::Integer(value) => Ok(value.to_string()),
++        ManagedValue::Float(value) => {
++            if value.is_finite() {
++                Ok(value.to_string())
++            } else {
++                anyhow::bail!("cannot render a non-finite number")
++            }
++        }
++        ManagedValue::String(value) | ManagedValue::Choice(value) => Ok(nix_string(value)),
++        ManagedValue::Path(value) => Ok(format!("builtins.toPath {}", nix_string(value))),
++        ManagedValue::Package(value) => {
++            if !is_package_attr_path(value) {
++                anyhow::bail!("invalid package attribute path: {}", value);
++            }
++            Ok(format!("pkgs.{}", render_attr_path(value)))
++        }
++        ManagedValue::Json(value) => render_json_as_nix(value),
++    }
++}
++
++fn render_json_as_nix(value: &Value) -> Result<String> {
++    match value {
++        Value::Null => Ok("null".into()),
++        Value::Bool(value) => Ok(value.to_string()),
++        Value::Number(value) => Ok(value.to_string()),
++        Value::String(value) => Ok(nix_string(value)),
++        Value::Array(values) => {
++            let rendered = values
++                .iter()
++                .map(render_json_as_nix)
++                .collect::<Result<Vec<_>>>()?;
++            Ok(format!("[ {} ]", rendered.join(" ")))
++        }
++        Value::Object(values) => {
++            let mut rendered = Vec::with_capacity(values.len());
++            for (key, value) in values {
++                rendered.push(format!(
++                    "{} = {};",
++                    if is_nix_identifier(key) {
++                        key.to_string()
++                    } else {
++                        nix_string(key)
++                    },
++                    render_json_as_nix(value)?
++                ));
++            }
++            Ok(format!("{{ {} }}", rendered.join(" ")))
++        }
++    }
++}
++
++fn nix_string(value: &str) -> String {
++    let mut out = String::with_capacity(value.len() + 2);
++    out.push('"');
++    let mut chars = value.chars().peekable();
++    while let Some(ch) = chars.next() {
++        match ch {
++            '\\' => out.push_str("\\\\"),
++            '"' => out.push_str("\\\""),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            '\t' => out.push_str("\\t"),
++            '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
++            _ => out.push(ch),
++        }
++    }
++    out.push('"');
++    out
++}
++
++fn is_nix_identifier(value: &str) -> bool {
++    let mut chars = value.chars();
++    let Some(first) = chars.next() else {
++        return false;
++    };
++    if !(first.is_ascii_alphabetic() || first == '_') {
++        return false;
++    }
++    chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '\''))
++}
++
++fn is_package_attr_path(value: &str) -> bool {
++    !value.is_empty()
++        && !value.contains('<')
++        && !value.contains('>')
++        && value.split('.').all(is_nix_identifier)
++}
++
++#[cfg(test)]
++mod managed_tests {
++    use super::*;
++
++    #[test]
++    fn renders_managed_state_deterministically() {
++        let state = ManagedModuleState {
++            values: BTreeMap::from([
++                (
++                    "services.openssh.enable".into(),
++                    ManagedValue::Bool(true),
++                ),
++                (
++                    "services.openssh.ports".into(),
++                    ManagedValue::Json(Value::Array(vec![Value::from(22)])),
++                ),
++            ]),
++        };
++
++        let rendered = state.render_nix().unwrap();
++        assert!(rendered.contains("services.openssh.enable = true;"));
++        assert!(rendered.contains("services.openssh.ports = [ 22 ];"));
++        assert!(rendered.contains(MANAGED_STATE_PREFIX));
++        assert_eq!(rendered, state.render_nix().unwrap());
++    }
++
++    #[test]
++    fn escapes_interpolation_in_nix_strings() {
++        let state = ManagedModuleState {
++            values: BTreeMap::from([(
++                "services.test.message".into(),
++                ManagedValue::String("value ${notInterpolation}".into()),
++            )]),
++        };
++        let rendered = state.render_nix().unwrap();
++        assert!(rendered.contains(r#"\${notInterpolation}"#));
++    }
++
++    #[test]
++    fn package_attribute_paths_are_validated() {
++        let option = ModuleOptionSpec {
++            path: "services.test.package".into(),
++            relative_path: "package".into(),
++            type_name: "package".into(),
++            renderer: RendererKind::Package,
++            nullable: false,
++            choices: vec![],
++            dynamic_path: false,
++            read_only: false,
++            description: None,
++            default: None,
++            example: None,
++            declarations: vec![],
++        };
++
++        assert!(managed_value_from_text(&option, "python3Packages.requests").is_ok());
++        assert!(managed_value_from_text(&option, "import ./evil.nix").is_err());
++    }
++
++    #[test]
++    fn list_editor_requires_json_array() {
++        let mut option = ModuleOptionSpec {
++            path: "services.test.values".into(),
++            relative_path: "values".into(),
++            type_name: "list of string".into(),
++            renderer: RendererKind::List,
++            nullable: false,
++            choices: vec![],
++            dynamic_path: false,
++            read_only: false,
++            description: None,
++            default: None,
++            example: None,
++            declarations: vec![],
++        };
++
++        assert!(managed_value_from_text(&option, r#"["one", "two"]"#).is_ok());
++        assert!(managed_value_from_text(&option, r#"{"one": 1}"#).is_err());
++
++        option.renderer = RendererKind::KeyValue;
++        assert!(managed_value_from_text(&option, r#"{"one": 1}"#).is_ok());
++    }
++}
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index f7d8fcf..16e1fc8 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -3,6 +3,7 @@ pub mod categories;
+ pub mod categorypage;
+ pub mod categorytile;
+ pub mod installedpage;
++pub mod modulepage;
+ pub mod installworker;
+ pub mod pkgpage;
+ pub mod pkgtile;
+diff --git a/src/ui/modulepage.rs b/src/ui/modulepage.rs
+new file mode 100644
+index 0000000..eef1ac1
+--- /dev/null
++++ b/src/ui/modulepage.rs
+@@ -0,0 +1,930 @@
++use super::window::{AppMsg, REBUILD_BROKER};
++use crate::parse::modules::{
++    load_current_nixos_catalog, managed_config_path, managed_value_editor_text,
++    managed_value_from_text, ManagedModuleState, ManagedValue, ModuleCatalog, ModuleOptionSpec,
++    RendererKind,
++};
++use adw::prelude::*;
++use anyhow::{Context, Result};
++use log::{info, warn};
++use nix_data::config::configfile::NixDataConfig;
++use relm4::*;
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    path::{Path, PathBuf},
++    process::Stdio,
++};
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
++
++const MAX_VISIBLE_MODULES: usize = 250;
++const MAX_VISIBLE_OPTIONS: usize = 220;
++
++#[derive(Debug, Clone, PartialEq)]
++enum DraftValue {
++    Bool(bool),
++    Text(String),
++}
++
++#[derive(Debug)]
++pub struct LoadedCatalog {
++    catalog: ModuleCatalog,
++    state: ManagedModuleState,
++    managed_path: Option<PathBuf>,
++    integration_ready: bool,
++}
++
++#[tracker::track]
++pub struct ModulePageModel {
++    #[tracker::no_eq]
++    catalog: Option<ModuleCatalog>,
++    #[tracker::no_eq]
++    state: ManagedModuleState,
++    #[tracker::no_eq]
++    drafts: BTreeMap<String, DraftValue>,
++    #[tracker::no_eq]
++    removed: BTreeSet<String>,
++    #[tracker::no_eq]
++    module_list: gtk::ListBox,
++    #[tracker::no_eq]
++    detail_box: gtk::Box,
++    config: NixDataConfig,
++    query: String,
++    selected: Option<String>,
++    loading: bool,
++    busy: bool,
++    dirty: bool,
++    valid: bool,
++    integration_ready: bool,
++    status: String,
++    preview: String,
++}
++
++#[derive(Debug)]
++pub struct ModulePageInit {
++    pub config: NixDataConfig,
++}
++
++#[derive(Debug)]
++pub enum ModulePageMsg {
++    Load,
++    Refresh,
++    UpdateConfig(NixDataConfig),
++    Search(String),
++    Select(String),
++    SetBool(String, bool),
++    SetText(String, String),
++    Reset(String),
++    ResetModule,
++    Apply,
++}
++
++#[derive(Debug)]
++pub enum ModulePageAsyncMsg {
++    Loaded(Result<LoadedCatalog, String>),
++    Applied(Result<ManagedModuleState, String>),
++}
++
++#[relm4::component(pub)]
++impl Component for ModulePageModel {
++    type Init = ModulePageInit;
++    type Input = ModulePageMsg;
++    type Output = AppMsg;
++    type CommandOutput = ModulePageAsyncMsg;
++
++    view! {
++        gtk::Box {
++            set_orientation: gtk::Orientation::Vertical,
++            gtk::Box {
++                set_orientation: gtk::Orientation::Horizontal,
++                set_spacing: 8,
++                set_margin_all: 12,
++                gtk::SearchEntry {
++                    set_hexpand: true,
++                    set_tooltip_text: Some("Search NixOS modules such as services.openssh or programs.git"),
++                    connect_search_changed[sender] => move |entry| {
++                        sender.input(ModulePageMsg::Search(entry.text().to_string()));
++                    }
++                },
++                gtk::Button {
++                    set_icon_name: "view-refresh-symbolic",
++                    set_tooltip_text: Some("Refresh NixOS option metadata"),
++                    #[watch]
++                    set_sensitive: !model.loading && !model.busy,
++                    connect_clicked[sender] => move |_| {
++                        sender.input(ModulePageMsg::Refresh);
++                    }
++                }
++            },
++            gtk::Separator {},
++            gtk::Box {
++                set_orientation: gtk::Orientation::Horizontal,
++                set_vexpand: true,
++                gtk::ScrolledWindow {
++                    set_width_request: 355,
++                    set_vexpand: true,
++                    set_hscrollbar_policy: gtk::PolicyType::Never,
++                    #[local_ref]
++                    module_list -> gtk::ListBox {
++                        add_css_class: "boxed-list",
++                        set_margin_all: 12,
++                        set_selection_mode: gtk::SelectionMode::None,
++                    }
++                },
++                gtk::Separator {
++                    set_orientation: gtk::Orientation::Vertical,
++                },
++                gtk::Box {
++                    set_orientation: gtk::Orientation::Vertical,
++                    set_hexpand: true,
++                    set_vexpand: true,
++                    gtk::ScrolledWindow {
++                        set_hexpand: true,
++                        set_vexpand: true,
++                        set_hscrollbar_policy: gtk::PolicyType::Never,
++                        #[local_ref]
++                        detail_box -> gtk::Box {
++                            set_orientation: gtk::Orientation::Vertical,
++                            set_spacing: 10,
++                            set_margin_all: 16,
++                        }
++                    },
++                    gtk::Expander {
++                        set_label: Some("Preview generated Nix"),
++                        set_margin_start: 16,
++                        set_margin_end: 16,
++                        set_margin_bottom: 8,
++                        gtk::ScrolledWindow {
++                            set_min_content_height: 120,
++                            set_max_content_height: 260,
++                            set_hscrollbar_policy: gtk::PolicyType::Automatic,
++                            gtk::Label {
++                                add_css_class: "monospace",
++                                set_selectable: true,
++                                set_xalign: 0.0,
++                                set_yalign: 0.0,
++                                set_wrap: false,
++                                #[watch]
++                                set_label: &model.preview,
++                            }
++                        }
++                    },
++                    gtk::Separator {},
++                    gtk::Box {
++                        set_orientation: gtk::Orientation::Horizontal,
++                        set_spacing: 10,
++                        set_margin_all: 12,
++                        gtk::Label {
++                            set_hexpand: true,
++                            set_halign: gtk::Align::Start,
++                            set_ellipsize: gtk::pango::EllipsizeMode::End,
++                            #[watch]
++                            set_label: &model.status,
++                        },
++                        gtk::Button {
++                            set_label: "Reset module",
++                            #[watch]
++                            set_sensitive: model.selected.is_some() && !model.busy,
++                            connect_clicked[sender] => move |_| {
++                                sender.input(ModulePageMsg::ResetModule);
++                            }
++                        },
++                        gtk::Button {
++                            add_css_class: "suggested-action",
++                            #[watch]
++                            set_label: if model.busy { "Applying..." } else { "Apply & Rebuild" },
++                            #[watch]
++                            set_sensitive: model.dirty
++                                && model.valid
++                                && model.integration_ready
++                                && !model.loading
++                                && !model.busy,
++                            connect_clicked[sender] => move |_| {
++                                sender.input(ModulePageMsg::Apply);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    fn init(
++        params: Self::Init,
++        _root: &Self::Root,
++        sender: ComponentSender<Self>,
++    ) -> ComponentParts<Self> {
++        let module_list = gtk::ListBox::new();
++        let detail_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
++        let integration_ready = managed_config_path(params.config.systemconfig.as_deref())
++            .map(|path| path.exists())
++            .unwrap_or(false);
++
++        let model = ModulePageModel {
++            catalog: None,
++            state: ManagedModuleState::default(),
++            drafts: BTreeMap::new(),
++            removed: BTreeSet::new(),
++            module_list,
++            detail_box,
++            config: params.config,
++            query: String::new(),
++            selected: None,
++            loading: false,
++            busy: false,
++            dirty: false,
++            valid: true,
++            integration_ready,
++            status: "Open the Modules page to load NixOS option metadata.".into(),
++            preview: "# No module edits yet.\n".into(),
++            tracker: 0,
++        };
++
++        let module_list = &model.module_list;
++        let detail_box = &model.detail_box;
++        let widgets = view_output!();
++
++        model.render_placeholder("Select a generated NixOS module to inspect its options.");
++
++        ComponentParts { model, widgets }
++    }
++
++    fn update(
++        &mut self,
++        msg: Self::Input,
++        sender: ComponentSender<Self>,
++        _root: &Self::Root,
++    ) {
++        self.reset();
++        match msg {
++            ModulePageMsg::Load => {
++                if self.loading || self.catalog.is_some() {
++                    return;
++                }
++                self.set_loading(true);
++                self.set_status("Loading current NixOS module metadata...".into());
++                self.render_placeholder("Loading NixOS options and generating the module catalog...");
++
++                let managed_path = managed_config_path(self.config.systemconfig.as_deref());
++                sender.command(move |out, shutdown| {
++                    shutdown
++                        .register(async move {
++                            let result = tokio::task::spawn_blocking(move || {
++                                let catalog = load_current_nixos_catalog()
++                                    .map_err(|error| error.to_string())?;
++                                let state = match managed_path.as_ref() {
++                                    Some(path) => ManagedModuleState::load_from_file(path)
++                                        .map_err(|error| error.to_string())?,
++                                    None => ManagedModuleState::default(),
++                                };
++                                let integration_ready = managed_path
++                                    .as_ref()
++                                    .map(|path| path.exists())
++                                    .unwrap_or(false);
++                                Ok(LoadedCatalog {
++                                    catalog,
++                                    state,
++                                    managed_path,
++                                    integration_ready,
++                                })
++                            })
++                            .await
++                            .map_err(|error| error.to_string())
++                            .and_then(|result| result);
++                            let _ = out.send(ModulePageAsyncMsg::Loaded(result));
++                        })
++                        .drop_on_shutdown()
++                });
++            }
++            ModulePageMsg::Refresh => {
++                self.catalog = None;
++                self.selected = None;
++                self.drafts.clear();
++                self.removed.clear();
++                self.set_dirty(false);
++                self.module_list_remove_all();
++                sender.input(ModulePageMsg::Load);
++            }
++            ModulePageMsg::UpdateConfig(config) => {
++                self.config = config;
++                let managed_path = managed_config_path(self.config.systemconfig.as_deref());
++                self.set_integration_ready(
++                    managed_path
++                        .as_ref()
++                        .map(|path| path.exists())
++                        .unwrap_or(false),
++                );
++                if let Some(path) = managed_path {
++                    match ManagedModuleState::load_from_file(path) {
++                        Ok(state) => self.state = state,
++                        Err(error) => warn!("Could not reload managed module state: {}", error),
++                    }
++                }
++                self.refresh_preview();
++                self.render_selected(&sender);
++            }
++            ModulePageMsg::Search(query) => {
++                self.set_query(query);
++                self.render_module_list(&sender);
++            }
++            ModulePageMsg::Select(id) => {
++                self.set_selected(Some(id));
++                self.render_selected(&sender);
++            }
++            ModulePageMsg::SetBool(path, value) => {
++                self.removed.remove(&path);
++                self.drafts.insert(path, DraftValue::Bool(value));
++                self.refresh_dirty();
++                self.refresh_preview();
++            }
++            ModulePageMsg::SetText(path, value) => {
++                self.removed.remove(&path);
++                self.drafts.insert(path, DraftValue::Text(value));
++                self.refresh_dirty();
++                self.refresh_preview();
++            }
++            ModulePageMsg::Reset(path) => {
++                self.drafts.remove(&path);
++                if self.state.values.contains_key(&path) {
++                    self.removed.insert(path);
++                } else {
++                    self.removed.remove(&path);
++                }
++                self.refresh_dirty();
++                self.refresh_preview();
++                self.render_selected(&sender);
++            }
++            ModulePageMsg::ResetModule => {
++                let Some(root) = self.selected.clone() else {
++                    return;
++                };
++                let paths = self
++                    .catalog
++                    .as_ref()
++                    .and_then(|catalog| catalog.get(&root))
++                    .map(|module| module.options.iter().map(|option| option.path.clone()).collect::<Vec<_>>())
++                    .unwrap_or_default();
++                for path in paths {
++                    self.drafts.remove(&path);
++                    if self.state.values.contains_key(&path) {
++                        self.removed.insert(path);
++                    }
++                }
++                self.refresh_dirty();
++                self.refresh_preview();
++                self.render_selected(&sender);
++            }
++            ModulePageMsg::Apply => {
++                if self.busy || !self.dirty || !self.integration_ready {
++                    return;
++                }
++                let next_state = match self.merged_state() {
++                    Ok(state) => state,
++                    Err(error) => {
++                        self.set_valid(false);
++                        self.set_status(format!("Cannot apply: {}", error));
++                        return;
++                    }
++                };
++                let source = match next_state.render_nix() {
++                    Ok(source) => source,
++                    Err(error) => {
++                        self.set_valid(false);
++                        self.set_status(format!("Cannot generate Nix: {}", error));
++                        return;
++                    }
++                };
++                let Some(path) = managed_config_path(self.config.systemconfig.as_deref()) else {
++                    self.set_status("No NixOS configuration file is configured.".into());
++                    return;
++                };
++                let config = self.config.clone();
++                self.set_busy(true);
++                self.set_status("Testing the generated module configuration before switching...".into());
++                REBUILD_BROKER.send(super::rebuild::RebuildMsg::Show);
++
++                sender.command(move |out, shutdown| {
++                    shutdown
++                        .register(async move {
++                            let result = apply_managed_configuration(source, path, config)
++                                .await
++                                .map(|_| next_state)
++                                .map_err(|error| error.to_string());
++                            let _ = out.send(ModulePageAsyncMsg::Applied(result));
++                        })
++                        .drop_on_shutdown()
++                });
++            }
++        }
++    }
++
++    fn update_cmd(
++        &mut self,
++        msg: Self::CommandOutput,
++        sender: ComponentSender<Self>,
++        _root: &Self::Root,
++    ) {
++        self.reset();
++        match msg {
++            ModulePageAsyncMsg::Loaded(result) => {
++                self.set_loading(false);
++                match result {
++                    Ok(loaded) => {
++                        let module_count = loaded.catalog.stats.module_count;
++                        let automatic = loaded.catalog.stats.automatic_options;
++                        let advanced = loaded.catalog.stats.advanced_options;
++                        self.catalog = Some(loaded.catalog);
++                        self.state = loaded.state;
++                        self.set_integration_ready(loaded.integration_ready);
++                        self.drafts.clear();
++                        self.removed.clear();
++                        self.set_dirty(false);
++                        self.set_valid(true);
++                        self.refresh_preview();
++                        self.set_status(if loaded.integration_ready {
++                            format!(
++                                "{} generated modules loaded • {} automatic options • {} advanced fallbacks",
++                                module_count, automatic, advanced
++                            )
++                        } else if let Some(path) = loaded.managed_path {
++                            format!(
++                                "{} modules loaded. Apply is disabled until {} is installed/imported.",
++                                module_count,
++                                path.display()
++                            )
++                        } else {
++                            format!(
++                                "{} modules loaded. Configure a NixOS configuration file to enable Apply.",
++                                module_count
++                            )
++                        });
++                        self.render_module_list(&sender);
++                    }
++                    Err(error) => {
++                        self.set_status(format!("Module metadata load failed: {}", error));
++                        self.render_placeholder("Could not load NixOS module metadata. Use Refresh to retry.");
++                    }
++                }
++            }
++            ModulePageAsyncMsg::Applied(result) => {
++                self.set_busy(false);
++                match result {
++                    Ok(state) => {
++                        self.state = state;
++                        self.drafts.clear();
++                        self.removed.clear();
++                        self.set_dirty(false);
++                        self.set_valid(true);
++                        self.refresh_preview();
++                        self.set_status("Configuration tested and switched successfully.".into());
++                        REBUILD_BROKER.send(super::rebuild::RebuildMsg::FinishSuccess);
++                        self.render_selected(&sender);
++                    }
++                    Err(error) => {
++                        self.set_status(format!("Apply failed and the managed file was restored: {}", error));
++                        REBUILD_BROKER.send(super::rebuild::RebuildMsg::FinishError(Some(error)));
++                    }
++                }
++            }
++        }
++    }
++}
++
++impl ModulePageModel {
++    fn module_list_remove_all(&self) {
++        while let Some(child) = self.module_list.first_child() {
++            self.module_list.remove(&child);
++        }
++    }
++
++    fn detail_remove_all(&self) {
++        while let Some(child) = self.detail_box.first_child() {
++            self.detail_box.remove(&child);
++        }
++    }
++
++    fn render_placeholder(&self, text: &str) {
++        self.detail_remove_all();
++        let label = gtk::Label::new(Some(text));
++        label.set_wrap(true);
++        label.set_halign(gtk::Align::Start);
++        label.add_css_class("dim-label");
++        self.detail_box.append(&label);
++    }
++
++    fn render_module_list(&mut self, sender: &ComponentSender<Self>) {
++        self.module_list_remove_all();
++        let Some(catalog) = self.catalog.as_ref() else {
++            return;
++        };
++        let query = self.query.trim().to_lowercase();
++        let mut visible = Vec::new();
++
++        for (id, module) in &catalog.modules {
++            if !query.is_empty()
++                && !id.to_lowercase().contains(&query)
++                && !module.title.to_lowercase().contains(&query)
++            {
++                continue;
++            }
++            visible.push(id.clone());
++            if visible.len() >= MAX_VISIBLE_MODULES {
++                break;
++            }
++        }
++
++        for id in &visible {
++            let Some(module) = catalog.get(id) else {
++                continue;
++            };
++            let row = adw::ActionRow::new();
++            row.set_use_markup(false);
++            row.set_title(&module.title);
++            row.set_subtitle(&format!(
++                "{} automatic • {} advanced",
++                module.automatic_options, module.advanced_options
++            ));
++            row.set_activatable(true);
++            let row_id = id.clone();
++            let sender = sender.clone();
++            row.connect_activated(move |_| {
++                sender.input(ModulePageMsg::Select(row_id.clone()));
++            });
++            self.module_list.append(&row);
++        }
++
++        if visible.is_empty() {
++            let row = adw::ActionRow::new();
++            row.set_use_markup(false);
++            row.set_title("No generated modules match this search");
++            self.module_list.append(&row);
++            return;
++        }
++
++        let selected_visible = self
++            .selected
++            .as_ref()
++            .map(|selected| visible.iter().any(|id| id == selected))
++            .unwrap_or(false);
++        if !selected_visible {
++            sender.input(ModulePageMsg::Select(visible[0].clone()));
++        }
++    }
++
++    fn render_selected(&mut self, sender: &ComponentSender<Self>) {
++        self.detail_remove_all();
++        let Some(id) = self.selected.clone() else {
++            self.render_placeholder("Select a module from the left.");
++            return;
++        };
++        let Some(catalog) = self.catalog.as_ref() else {
++            self.render_placeholder("Module metadata has not been loaded.");
++            return;
++        };
++        let Some(module) = catalog.get(&id) else {
++            self.render_placeholder("The selected module is no longer present.");
++            return;
++        };
++
++        let title = gtk::Label::new(Some(&module.title));
++        title.set_halign(gtk::Align::Start);
++        title.set_selectable(true);
++        title.add_css_class("title-2");
++        self.detail_box.append(&title);
++
++        let summary = gtk::Label::new(Some(&format!(
++            "{} options • {} automatically editable • {} advanced fallbacks • {} read-only",
++            module.options.len(),
++            module.automatic_options,
++            module.advanced_options,
++            module.read_only_options
++        )));
++        summary.set_halign(gtk::Align::Start);
++        summary.add_css_class("dim-label");
++        self.detail_box.append(&summary);
++
++        let list = gtk::ListBox::new();
++        list.add_css_class("boxed-list");
++        list.set_selection_mode(gtk::SelectionMode::None);
++
++        let mut options = module.options.iter().collect::<Vec<_>>();
++        options.sort_by_key(|option| (option.relative_path != "enable", option.relative_path.clone()));
++        let total_options = options.len();
++        for option in options.into_iter().take(MAX_VISIBLE_OPTIONS) {
++            list.append(&self.option_row(option, sender));
++        }
++        self.detail_box.append(&list);
++
++        if total_options > MAX_VISIBLE_OPTIONS {
++            let note = gtk::Label::new(Some(&format!(
++                "Showing the first {} of {} options. Narrower generated child modules are listed separately.",
++                MAX_VISIBLE_OPTIONS, total_options
++            )));
++            note.set_wrap(true);
++            note.set_halign(gtk::Align::Start);
++            note.add_css_class("dim-label");
++            self.detail_box.append(&note);
++        }
++    }
++
++    fn option_row(&self, option: &ModuleOptionSpec, sender: &ComponentSender<Self>) -> adw::ActionRow {
++        let row = adw::ActionRow::new();
++        row.set_use_markup(false);
++        row.set_title(if option.relative_path.is_empty() {
++            &option.path
++        } else {
++            &option.relative_path
++        });
++        let description = option
++            .description
++            .as_deref()
++            .unwrap_or("")
++            .replace('\n', " ");
++        row.set_subtitle(&format!(
++            "{}{}{}",
++            option.type_name,
++            if description.is_empty() { "" } else { " — " },
++            description
++        ));
++
++        if option.read_only {
++            let badge = gtk::Label::new(Some("Read-only"));
++            badge.add_css_class("dim-label");
++            row.add_suffix(&badge);
++            return row;
++        }
++        if option.renderer == RendererKind::Advanced {
++            let badge = gtk::Label::new(Some("Advanced"));
++            badge.add_css_class("dim-label");
++            row.add_suffix(&badge);
++            return row;
++        }
++
++        let has_override = self.has_effective_override(&option.path);
++        if has_override {
++            let reset = gtk::Button::new();
++            reset.set_icon_name("edit-undo-symbolic");
++            reset.set_tooltip_text(Some("Return this option to the NixOS default"));
++            reset.set_valign(gtk::Align::Center);
++            let path = option.path.clone();
++            let sender = sender.clone();
++            reset.connect_clicked(move |_| {
++                sender.input(ModulePageMsg::Reset(path.clone()));
++            });
++            row.add_suffix(&reset);
++        }
++
++        match option.renderer {
++            RendererKind::Toggle => {
++                let switch = gtk::Switch::new();
++                switch.set_valign(gtk::Align::Center);
++                switch.set_active(self.effective_bool(option));
++                let path = option.path.clone();
++                let sender = sender.clone();
++                switch.connect_state_set(move |_, value| {
++                    sender.input(ModulePageMsg::SetBool(path.clone(), value));
++                    gtk::Inhibit(false)
++                });
++                row.add_suffix(&switch);
++            }
++            RendererKind::Choice if !option.choices.is_empty() => {
++                let combo = gtk::ComboBoxText::new();
++                combo.set_valign(gtk::Align::Center);
++                let current = self.effective_text(option);
++                let mut active = None;
++                let mut offset = 0usize;
++                if option.nullable {
++                    combo.append_text("null");
++                    if current == "null" {
++                        active = Some(0);
++                    }
++                    offset = 1;
++                }
++                for (index, choice) in option.choices.iter().enumerate() {
++                    combo.append_text(choice);
++                    if current == *choice {
++                        active = Some((index + offset) as u32);
++                    }
++                }
++                combo.set_active(active);
++                let path = option.path.clone();
++                let sender = sender.clone();
++                combo.connect_changed(move |combo| {
++                    if let Some(text) = combo.active_text() {
++                        sender.input(ModulePageMsg::SetText(path.clone(), text.to_string()));
++                    }
++                });
++                row.add_suffix(&combo);
++            }
++            _ => {
++                let entry = gtk::Entry::new();
++                entry.set_valign(gtk::Align::Center);
++                entry.set_width_chars(28);
++                entry.set_hexpand(false);
++                entry.set_text(&self.effective_text(option));
++                entry.set_placeholder_text(Some(match option.renderer {
++                    RendererKind::List => "JSON array, e.g. [\"one\", \"two\"]",
++                    RendererKind::KeyValue => "JSON object, e.g. {\"key\": \"value\"}",
++                    RendererKind::Package => "nixpkgs attribute, e.g. firefox",
++                    RendererKind::Path => "/path/to/value",
++                    RendererKind::Integer => "integer",
++                    RendererKind::Float => "number",
++                    _ => "value",
++                }));
++                let path = option.path.clone();
++                let sender = sender.clone();
++                entry.connect_changed(move |entry| {
++                    sender.input(ModulePageMsg::SetText(path.clone(), entry.text().to_string()));
++                });
++                row.add_suffix(&entry);
++            }
++        }
++
++        row
++    }
++
++    fn effective_bool(&self, option: &ModuleOptionSpec) -> bool {
++        if let Some(DraftValue::Bool(value)) = self.drafts.get(&option.path) {
++            return *value;
++        }
++        if !self.removed.contains(&option.path) {
++            if let Some(ManagedValue::Bool(value)) = self.state.values.get(&option.path) {
++                return *value;
++            }
++        }
++        option
++            .default
++            .as_ref()
++            .and_then(|value| value.as_bool())
++            .unwrap_or(false)
++    }
++
++    fn effective_text(&self, option: &ModuleOptionSpec) -> String {
++        if let Some(DraftValue::Text(value)) = self.drafts.get(&option.path) {
++            return value.clone();
++        }
++        if !self.removed.contains(&option.path) {
++            if let Some(value) = self.state.values.get(&option.path) {
++                return managed_value_editor_text(value);
++            }
++        }
++        option_default_editor_text(option)
++    }
++
++    fn has_effective_override(&self, path: &str) -> bool {
++        self.drafts.contains_key(path)
++            || (self.state.values.contains_key(path) && !self.removed.contains(path))
++    }
++
++    fn find_option(&self, path: &str) -> Option<&ModuleOptionSpec> {
++        self.catalog.as_ref()?.modules.values().find_map(|module| {
++            module.options.iter().find(|option| option.path == path)
++        })
++    }
++
++    fn merged_state(&self) -> Result<ManagedModuleState> {
++        let mut state = self.state.clone();
++        for path in &self.removed {
++            state.values.remove(path);
++        }
++        for (path, draft) in &self.drafts {
++            let option = self
++                .find_option(path)
++                .with_context(|| format!("option metadata disappeared for {}", path))?;
++            let value = match draft {
++                DraftValue::Bool(value) => ManagedValue::Bool(*value),
++                DraftValue::Text(value) => managed_value_from_text(option, value)
++                    .with_context(|| format!("{}: invalid value", path))?,
++            };
++            state.values.insert(path.clone(), value);
++        }
++        Ok(state)
++    }
++
++    fn refresh_dirty(&mut self) {
++        self.set_dirty(!self.drafts.is_empty() || !self.removed.is_empty());
++        if self.dirty {
++            self.set_status(if self.integration_ready {
++                "Unsaved module changes. Apply will run nixos-rebuild test before switch.".into()
++            } else {
++                "Changes are staged, but the managed NixOS integration file is not installed.".into()
++            });
++        }
++    }
++
++    fn refresh_preview(&mut self) {
++        match self
++            .merged_state()
++            .and_then(|state| state.render_nix())
++        {
++            Ok(preview) => {
++                self.set_valid(true);
++                self.set_preview(preview);
++            }
++            Err(error) => {
++                self.set_valid(false);
++                self.set_preview(format!("# Invalid staged value\n# {}\n", error));
++                self.set_status(format!("Fix the invalid value before applying: {}", error));
++            }
++        }
++    }
++}
++
++fn option_default_editor_text(option: &ModuleOptionSpec) -> String {
++    let Some(default) = option.default.as_ref() else {
++        return String::new();
++    };
++    match option.renderer {
++        RendererKind::Integer => default.as_i64().map(|value| value.to_string()).unwrap_or_default(),
++        RendererKind::Float => default.as_f64().map(|value| value.to_string()).unwrap_or_default(),
++        RendererKind::Text | RendererKind::Choice | RendererKind::Path | RendererKind::Package => {
++            default.as_str().unwrap_or_default().to_string()
++        }
++        RendererKind::List if default.is_array() => serde_json::to_string_pretty(default).unwrap_or_default(),
++        RendererKind::KeyValue if default.is_object() => serde_json::to_string_pretty(default).unwrap_or_default(),
++        _ => String::new(),
++    }
++}
++
++async fn apply_managed_configuration(
++    source: String,
++    path: PathBuf,
++    config: NixDataConfig,
++) -> Result<()> {
++    let exe = helper_path();
++    let mut command = tokio::process::Command::new("pkexec");
++    command
++        .arg(&exe)
++        .arg("managed-config")
++        .arg("--generations")
++        .arg(config.generations.unwrap_or(0).to_string())
++        .arg("--output")
++        .arg(&path)
++        .arg("--")
++        .arg("--impure")
++        .stdin(Stdio::piped())
++        .stderr(Stdio::piped());
++
++    if let Some(flake) = config.flake {
++        let flake = if let Some(flakearg) = config.flakearg {
++            format!("{}#{}", flake, flakearg)
++        } else {
++            flake
++        };
++        command.arg("--flake");
++        for arg in flake.split(' ') {
++            if !arg.is_empty() {
++                command.arg(arg);
++            }
++        }
++    }
++
++    let mut child = command.spawn().context("could not launch privileged rebuild helper")?;
++    child
++        .stdin
++        .take()
++        .context("could not open helper stdin")?
++        .write_all(source.as_bytes())
++        .await
++        .context("could not send generated Nix to helper")?;
++
++    let stderr = child.stderr.take().context("could not capture rebuild output")?;
++    let mut lines = tokio::io::BufReader::new(stderr).lines();
++    let mut captured = Vec::new();
++    while let Some(line) = lines.next_line().await? {
++        REBUILD_BROKER.send(super::rebuild::RebuildMsg::UpdateText(line.clone()));
++        captured.push(line);
++        if captured.len() > 50 {
++            captured.remove(0);
++        }
++    }
++
++    let status = child.wait().await.context("could not wait for rebuild helper")?;
++    if status.success() {
++        Ok(())
++    } else {
++        let message = if captured.is_empty() {
++            format!("managed rebuild helper exited with {}", status)
++        } else {
++            captured.join("\n")
++        };
++        anyhow::bail!(message)
++    }
++}
++
++fn helper_path() -> String {
++    match std::env::current_exe() {
++        Ok(mut exe) => {
++            exe.pop();
++            exe.pop();
++            exe.push("libexec");
++            exe.push("nsc-helper");
++            let candidate = exe.to_string_lossy().to_string();
++            if Path::new(&candidate).is_file() {
++                candidate
++            } else {
++                "nsc-helper".into()
++            }
++        }
++        Err(_) => "nsc-helper".into(),
++    }
++}
+diff --git a/src/ui/window.rs b/src/ui/window.rs
+index 2df2b81..629763d 100644
+--- a/src/ui/window.rs
++++ b/src/ui/window.rs
+@@ -6,8 +6,9 @@ use crate::{
+         util,
+     },
+     ui::{
+-        installedpage::InstalledItem, pkgpage::PkgPageInit, rebuild::RebuildMsg,
+-        unavailabledialog::UnavailableDialogMsg, updatepage::UNAVAILABLE_BROKER,
++        installedpage::InstalledItem, modulepage::{ModulePageInit, ModulePageMsg},
++        pkgpage::PkgPageInit, rebuild::RebuildMsg, unavailabledialog::UnavailableDialogMsg,
++        updatepage::UNAVAILABLE_BROKER,
+         welcome::WelcomeMsg,
+     },
+     APPINFO,
+@@ -37,6 +38,7 @@ use super::{
+     categorypage::{CategoryPageModel, CategoryPageMsg},
+     categorytile::CategoryTile,
+     installedpage::{InstalledPageModel, InstalledPageMsg},
++    modulepage::ModulePageModel,
+     pkgpage::{self, InstallType, PkgInitModel, PkgModel, PkgMsg, WorkPkg},
+     pkgtile::PkgTile,
+     preferencespage::{PreferencesPageModel, PreferencesPageMsg},
+@@ -125,6 +127,8 @@ pub struct AppModel {
+     #[tracker::no_eq]
+     installedpage: Controller<InstalledPageModel>,
+     #[tracker::no_eq]
++    modulepage: Controller<ModulePageModel>,
++    #[tracker::no_eq]
+     updatepage: Controller<UpdatePageModel>,
+     viewstack: adw::ViewStack,
+     installedpagebusy: Vec<(String, InstallType)>,
+@@ -259,6 +263,8 @@ impl Component for AppModel {
+                                     add_css_class: "flat",
+                                     set_icon_name: "system-search-symbolic",
+                                     #[watch]
++                                    set_visible: model.vschild != "modules",
++                                    #[watch]
+                                     #[block_signal(searchtoggle)]
+                                     set_active: model.searching,
+                                     connect_toggled[sender] => move |x| {
+@@ -363,6 +369,7 @@ impl Component for AppModel {
+                                     }
+                                 },
+                                 add: model.installedpage.widget(),
++                                add: model.modulepage.widget(),
+                                 add: model.searchpage.widget(),
+                                 add: model.updatepage.widget(),
+                             },
+@@ -511,6 +518,11 @@ impl Component for AppModel {
+         let installedpage = InstalledPageModel::builder()
+             .launch((syspkgtype.clone(), userpkgtype.clone()))
+             .forward(sender.input_sender(), identity);
++        let modulepage = ModulePageModel::builder()
++            .launch(ModulePageInit {
++                config: config.clone(),
++            })
++            .forward(sender.input_sender(), identity);
+         let updatepage = UpdatePageModel::builder()
+             .launch(UpdatePageInit {
+                 window: root.clone().upcast(),
+@@ -562,6 +574,7 @@ impl Component for AppModel {
+             vschild: String::default(),
+             showvsbar: false,
+             installedpage,
++            modulepage,
+             updatepage,
+             viewstack,
+             installedpagebusy: vec![],
+@@ -625,17 +638,22 @@ impl Component for AppModel {
+         widgets.main_stack.set_hhomogeneous(false);
+         let frontvs = widgets.viewstack.page(&widgets.frontpage);
+         let installedvs = widgets.viewstack.page(model.installedpage.widget());
++        let modulesvs = widgets.viewstack.page(model.modulepage.widget());
+         let updatesvs = widgets.viewstack.page(model.updatepage.widget());
+         let searchvs = widgets.viewstack.page(model.searchpage.widget());
+         frontvs.set_title(Some("Explore"));
+         installedvs.set_title(Some("Installed"));
++        modulesvs.set_title(Some("Modules"));
++        modulesvs.set_visible(Path::new("/etc/NIXOS").exists());
+         updatesvs.set_title(Some("Updates"));
+         frontvs.set_name(Some("explore"));
+         installedvs.set_name(Some("installed"));
++        modulesvs.set_name(Some("modules"));
+         searchvs.set_name(Some("search"));
+         updatesvs.set_name(Some("updates"));
+         frontvs.set_icon_name(Some("nsc-home-symbolic"));
+         installedvs.set_icon_name(Some("nsc-installed-symbolic"));
++        modulesvs.set_icon_name(Some("preferences-system-symbolic"));
+         updatesvs.set_icon_name(Some("nsc-update-symbolic"));
+ 
+         ComponentParts { model, widgets }
+@@ -699,6 +717,8 @@ impl Component for AppModel {
+                     self.userpkgtype.clone(),
+                 ));
+                 self.pkgpage.emit(PkgMsg::UpdateConfig(self.config.clone()));
++                self.modulepage
++                    .emit(ModulePageMsg::UpdateConfig(self.config.clone()));
+                 self.updatepage.emit(UpdatePageMsg::UpdatePkgTypes(
+                     self.syspkgtype.clone(),
+                     self.userpkgtype.clone(),
+@@ -742,6 +762,8 @@ impl Component for AppModel {
+                 }
+ 
+                 self.pkgpage.emit(PkgMsg::UpdateConfig(self.config.clone()));
++                self.modulepage
++                    .emit(ModulePageMsg::UpdateConfig(self.config.clone()));
+                 self.updatepage
+                     .emit(UpdatePageMsg::UpdateConfig(self.config.clone()));
+                 self.pkgpage.emit(PkgMsg::UpdatePkgTypes(
+@@ -778,6 +800,8 @@ impl Component for AppModel {
+                 }
+ 
+                 self.pkgpage.emit(PkgMsg::UpdateConfig(self.config.clone()));
++                self.modulepage
++                    .emit(ModulePageMsg::UpdateConfig(self.config.clone()));
+                 self.updatepage
+                     .emit(UpdatePageMsg::UpdateConfig(self.config.clone()));
+                 self.pkgpage.emit(PkgMsg::UpdatePkgTypes(
+@@ -811,6 +835,8 @@ impl Component for AppModel {
+                 self.categoryall = categoryall;
+ 
+                 self.pkgpage.emit(PkgMsg::UpdateConfig(self.config.clone()));
++                self.modulepage
++                    .emit(ModulePageMsg::UpdateConfig(self.config.clone()));
+                 self.updatepage
+                     .emit(UpdatePageMsg::UpdateConfig(self.config.clone()));
+                 sender.input(AppMsg::UpdateRecPkgs(recommendedapps));
+@@ -1616,6 +1642,9 @@ FROM pkgs JOIN meta ON (pkgs.attribute = meta.attribute) WHERE pkgs.attribute =
+                 if name == "updates" && self.online {
+                     sender.input(AppMsg::CheckNetwork);
+                 }
++                if name == "modules" {
++                    self.modulepage.emit(ModulePageMsg::Load);
++                }
+             }
+             AppMsg::SetVsBar(vsbar) => {
+                 self.set_showvsbar(vsbar);
