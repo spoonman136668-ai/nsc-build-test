@@ -25,6 +25,10 @@ if [[ -d "$SOURCE/.git" ]]; then
   if git -C "$SOURCE" rev-parse HEAD >/dev/null 2>&1 &&
      git -C "$SOURCE" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
     echo "Patched source already prepared."
+    # Nix flakes sourced from a Git worktree ignore untracked files. Stage the
+    # patched tree so newly-created Rust modules are visible to nix build.
+    git -C "$SOURCE" add -A
+    echo "Patched tree staged for Nix flake visibility."
     exit 0
   fi
   rm -rf "$SOURCE"
@@ -39,8 +43,12 @@ git -C "$SOURCE" apply --check "$PATCH"
 echo "Applying generated-modules UI patch..."
 git -C "$SOURCE" apply "$PATCH"
 
+# Critical for Git-backed Nix flakes: new files created by git apply are
+# otherwise untracked and excluded from the flake source.
+git -C "$SOURCE" add -A
+
 echo
-echo "Prepared source:"
+echo "Prepared and staged source:"
 git -C "$SOURCE" status --short
 echo
 echo "Bootstrap PASS."
