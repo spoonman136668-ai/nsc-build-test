@@ -28,6 +28,16 @@ git apply --reverse --check "$ROOT/nix-software-center-generated-modules-ui.patc
 echo "PATCH_APPLIED=PASS"
 echo
 
+echo "=== Git flake visibility proof ==="
+# Nix excludes untracked files from Git-backed flake sources. The patch adds
+# new Rust modules, so stage the patched tree before any Nix evaluation/build.
+git add -A
+git ls-files --error-unmatch src/parse/modules.rs
+git ls-files --error-unmatch src/ui/modulepage.rs
+git ls-files --error-unmatch src/bin/nsc-module-index.rs
+echo "NEW_MODULES_TRACKED=PASS"
+echo
+
 echo "=== Nix flake evaluation ==="
 nix flake show
 echo
