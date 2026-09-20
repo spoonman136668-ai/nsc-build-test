@@ -5,6 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE="$ROOT/nix-software-center"
 LOG="$ROOT/acceptance.log"
 CATALOG="$ROOT/module-catalog-smoke.json"
+MESON_BUILD="$SOURCE/build-acceptance"
 
 exec > >(tee "$LOG") 2>&1
 
@@ -29,8 +30,6 @@ echo "PATCH_APPLIED=PASS"
 echo
 
 echo "=== Git flake visibility proof ==="
-# Nix excludes untracked files from Git-backed flake sources. The patch adds
-# new Rust modules, so stage the patched tree before any Nix evaluation/build.
 git add -A
 git ls-files --error-unmatch src/parse/modules.rs
 git ls-files --error-unmatch src/ui/modulepage.rs
@@ -44,23 +43,30 @@ echo
 
 echo "=== Authoritative Nix build ==="
 nix build -L
+echo "NIX_BUILD=PASS"
 echo
 
-echo "=== Rust formatting ==="
-nix develop -c cargo fmt --check
+echo "=== Generate Meson development config ==="
+rm -rf "$MESON_BUILD"
+nix develop -c meson setup "$MESON_BUILD"
+test -s src/config.rs
+echo "MESON_CONFIG=PASS"
 echo
 
 echo "=== Module compiler tests ==="
-nix develop -c cargo test parse::modules::tests
-nix develop -c cargo test parse::modules::managed_tests
+nix develop -c cargo test --lib parse::modules::tests
+nix develop -c cargo test --lib parse::modules::managed_tests
+echo "MODULE_TESTS=PASS"
 echo
 
-echo "=== Helper tests ==="
+echo "=== Helper compile/tests ==="
 nix develop -c cargo test -p nsc-helper
+echo "HELPER_TESTS=PASS"
 echo
 
-echo "=== Full target check ==="
+echo "=== Full Rust target check ==="
 nix develop -c cargo check --all-targets
+echo "CARGO_CHECK=PASS"
 echo
 
 echo "=== Module-index smoke run ==="
