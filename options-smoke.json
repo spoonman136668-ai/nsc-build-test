@@ -1,0 +1,56 @@
+{
+  "services.openssh.enable": {
+    "declarations": ["nixos/modules/services/networking/ssh/sshd.nix"],
+    "default": false,
+    "description": "Enable the OpenSSH daemon.",
+    "example": true,
+    "loc": ["services", "openssh", "enable"],
+    "readOnly": false,
+    "type": "boolean"
+  },
+  "services.openssh.openFirewall": {
+    "declarations": ["nixos/modules/services/networking/ssh/sshd.nix"],
+    "default": false,
+    "description": "Open the configured SSH ports in the firewall.",
+    "example": true,
+    "loc": ["services", "openssh", "openFirewall"],
+    "readOnly": false,
+    "type": "boolean"
+  },
+  "services.openssh.ports": {
+    "declarations": ["nixos/modules/services/networking/ssh/sshd.nix"],
+    "default": [22],
+    "description": "Ports on which sshd listens.",
+    "example": [22, 2222],
+    "loc": ["services", "openssh", "ports"],
+    "readOnly": false,
+    "type": "list of 16 bit unsigned integer; between 0 and 65535 (both inclusive)"
+  },
+  "virtualisation.docker.enable": {
+    "declarations": ["nixos/modules/virtualisation/docker.nix"],
+    "default": false,
+    "description": "Enable Docker.",
+    "example": true,
+    "loc": ["virtualisation", "docker", "enable"],
+    "readOnly": false,
+    "type": "boolean"
+  },
+  "virtualisation.docker.daemon.settings": {
+    "declarations": ["nixos/modules/virtualisation/docker.nix"],
+    "default": {},
+    "description": "Docker daemon settings.",
+    "example": {},
+    "loc": ["virtualisation", "docker", "daemon", "settings"],
+    "readOnly": false,
+    "type": "attribute set of anything"
+  },
+  "networking.hostName": {
+    "declarations": ["nixos/modules/tasks/network-interfaces.nix"],
+    "default": "nixos",
+    "description": "Host name.",
+    "example": "workstation",
+    "loc": ["networking", "hostName"],
+    "readOnly": false,
+    "type": "string"
+  }
+}
